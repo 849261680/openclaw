@@ -1,0 +1,104 @@
+name: Proof 90491 NFS SQLite Journal
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  nfs-proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Install dependencies
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+
+      - name: Mount localhost NFS export
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y nfs-kernel-server nfs-common
+
+          sudo mkdir -p /tmp/openclaw-nfs-export /mnt/openclaw-nfs-proof
+          sudo chmod 0777 /tmp/openclaw-nfs-export /mnt/openclaw-nfs-proof
+          echo "/tmp/openclaw-nfs-export 127.0.0.1(rw,sync,no_subtree_check,no_root_squash)" | sudo tee /etc/exports
+          sudo exportfs -ra
+
+          if command -v systemctl >/dev/null 2>&1; then
+            sudo systemctl start rpcbind || true
+            sudo systemctl start nfs-server || sudo systemctl start nfs-kernel-server || true
+          fi
+          sudo service rpcbind start || true
+          sudo service nfs-kernel-server start || true
+          sudo rpcbind || true
+          sudo rpc.nfsd || true
+          sudo rpc.mountd || true
+
+          sudo mount -t nfs -o vers=3,nolock 127.0.0.1:/tmp/openclaw-nfs-export /mnt/openclaw-nfs-proof
+          mount | grep '/mnt/openclaw-nfs-proof'
+          findmnt -T /mnt/openclaw-nfs-proof -o TARGET,FSTYPE,SOURCE,OPTIONS
+          stat -f -c 'statfs-type-name=%T statfs-type-hex=%t' /mnt/openclaw-nfs-proof
+
+      - name: Run OpenClaw SQLite NFS proof
+        run: |
+          set -euo pipefail
+
+          export OPENCLAW_STATE_DIR=/mnt/openclaw-nfs-proof/openclaw-state
+          rm -rf "$OPENCLAW_STATE_DIR"
+          mkdir -p "$OPENCLAW_STATE_DIR"
+
+          run_probe() {
+            local label="$1"
+            PROOF_LABEL="$label" node --import tsx --input-type=module <<'NODE'
+          import fs from "node:fs";
+          import path from "node:path";
+          import {
+            closeOpenClawStateDatabaseForTest,
+            openOpenClawStateDatabase,
+          } from "./src/state/openclaw-state-db.ts";
+
+          const label = process.env.PROOF_LABEL;
+          const stateDir = process.env.OPENCLAW_STATE_DIR;
+          const database = openOpenClawStateDatabase({
+            env: { OPENCLAW_STATE_DIR: stateDir },
+          });
+          const journalMode = database.db.prepare("PRAGMA journal_mode").get()?.journal_mode;
+          database.db.exec("CREATE TABLE IF NOT EXISTS proof_90491 (id INTEGER PRIMARY KEY, label TEXT NOT NULL);");
+          database.db.prepare("INSERT INTO proof_90491 (label) VALUES (?)").run(label);
+          const count = database.db.prepare("SELECT COUNT(*) AS count FROM proof_90491").get()?.count;
+          const stateDbDir = path.dirname(database.path);
+          const files = fs.readdirSync(stateDbDir).sort();
+          closeOpenClawStateDatabaseForTest();
+
+          console.log(JSON.stringify({
+            label,
+            stateDir,
+            databasePath: database.path,
+            journalMode,
+            proofRows: Number(count),
+            hasWalSidecar: files.some((name) => name.endsWith("-wal") || name.endsWith("-shm")),
+            files,
+          }, null, 2));
+          NODE
+          }
+
+          run_probe first-open
+          run_probe restart-open
+
+          if find "$OPENCLAW_STATE_DIR" -name '*-wal' -o -name '*-shm' | grep .; then
+            echo "unexpected WAL/SHM sidecar on NFS state dir" >&2
+            exit 1
+          fi
+
+          echo "OpenClaw #90491 NFS proof passed"
+
