@@ -1,6 +1,14 @@
 // Create Dmg tests cover create dmg script behavior.
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -80,6 +88,16 @@ case "$command_name" in
     if [[ "\${HDIUTIL_DETACH_FAIL:-0}" == "1" ]]; then
       exit 9
     fi
+    detach_attempts_file="\${HDIUTIL_LOG}.detach-attempts"
+    detach_attempts=0
+    if [[ -f "$detach_attempts_file" ]]; then
+      detach_attempts="$(cat "$detach_attempts_file")"
+    fi
+    detach_attempts=$((detach_attempts + 1))
+    printf '%s' "$detach_attempts" > "$detach_attempts_file"
+    if (( detach_attempts <= \${HDIUTIL_DETACH_FAIL_COUNT:-0} )); then
+      exit 9
+    fi
     ;;
   resize)
     if [[ "\${1:-}" == "-limits" ]]; then
@@ -125,11 +143,35 @@ esac
 }
 
 function runScript(args: string[], env: NodeJS.ProcessEnv = {}) {
-  return spawnSync("bash", [scriptPath, ...args], {
+  return spawnSync("/bin/bash", [scriptPath, ...args], {
     cwd: process.cwd(),
     encoding: "utf8",
     env: { ...process.env, ...env },
   });
+}
+
+function readPngDimensions(imagePath: string): { width: number; height: number } {
+  const data = readFileSync(imagePath);
+  expect(data.subarray(1, 4).toString("ascii")).toBe("PNG");
+  return { width: data.readUInt32BE(16), height: data.readUInt32BE(20) };
+}
+
+function expectPrivateDmgMount(log: string): string {
+  const attach = log.match(/^attach (.+)\/image-rw\.dmg -mountpoint (.+) -nobrowse$/m);
+  const runRoot = attach?.[1];
+  const mountPoint = attach?.[2];
+  if (!runRoot || !mountPoint) {
+    throw new Error("Expected a DMG attach command with image and mount paths");
+  }
+  // TMPDIR may itself live under /Volumes; ownership comes from the per-run root.
+  expect(path.relative(tmpdir(), runRoot)).toMatch(/^openclaw-dmg\.[^/]+$/);
+  expect(mountPoint).toBe(path.join(runRoot, "mount"));
+  const detachTargets = Array.from(
+    log.matchAll(/^detach (.+?)(?: -(?:quiet|force))?$/gm),
+    ([, target]) => target,
+  );
+  expect(new Set(detachTargets)).toEqual(new Set([mountPoint]));
+  return mountPoint;
 }
 
 afterEach(() => {
@@ -177,6 +219,37 @@ describe("create-dmg plist validation", () => {
     expect(script).not.toContain('tell application "Finder" to close every window');
   });
 
+  it("keeps the larger Finder layout aligned with the packaged backgrounds", () => {
+    const script = readFileSync(scriptPath, "utf8");
+
+    expect(script).toContain('DMG_WINDOW_BOUNDS="${DMG_WINDOW_BOUNDS:-400 100 1080 530}"');
+    expect(script).toContain('DMG_ICON_SIZE="${DMG_ICON_SIZE:-144}"');
+    expect(script).toContain('DMG_APP_POS="${DMG_APP_POS:-170 305}"');
+    expect(script).toContain('DMG_APPS_POS="${DMG_APPS_POS:-510 305}"');
+    expect(readPngDimensions("apps/macos/Packaging/dmg-background-small.png")).toEqual({
+      width: 680,
+      height: 430,
+    });
+    expect(readPngDimensions("apps/macos/Packaging/dmg-background.png")).toEqual({
+      width: 1360,
+      height: 860,
+    });
+  });
+
+  it("fails malformed DMG resize slack before creating images", () => {
+    const script = readFileSync(scriptPath, "utf8");
+    const validationBlock = script.slice(
+      script.indexOf("require_integer_list()"),
+      script.indexOf("to_applescript_list4()"),
+    );
+
+    expect(validationBlock).toContain("require_nonnegative_integer()");
+    expect(validationBlock).toContain(
+      'require_nonnegative_integer DMG_EXTRA_SECTORS "$DMG_EXTRA_SECTORS"',
+    );
+    expect(validationBlock).toContain("must be a finite non-negative integer");
+  });
+
   it.runIf(process.platform === "darwin")(
     "fails before hdiutil when required plist keys are missing",
     () => {
@@ -207,12 +280,33 @@ describe.runIf(process.platform === "darwin")("create-dmg ownership boundaries",
     expect(readFileSync(output, "utf8")).toBe("converted");
     expect(readFileSync(sibling, "utf8")).toBe("caller owned");
     const log = readFileSync(tools.hdiutilLog, "utf8");
-    expect(log).toContain("image-rw.dmg -mountpoint");
+    expectPrivateDmgMount(log);
     expect(log).toContain("convert ");
+    // hdiutil sizes -srcfolder images with filesystem overhead; an explicit
+    // byte estimate underallocates bundles containing many small files.
+    const create = log.split("\n").find((line) => line.startsWith("create "));
+    expect(create).toContain("-srcfolder ");
+    expect(create).not.toMatch(/\s-(?:size|megabytes|sectors)\s/);
     expect(log).toContain("final.dmg");
     expect(log).toContain(`${outputDir}${path.sep}.openclaw-dmg.`);
-    expect(log).not.toContain("/Volumes/");
     expect(log).not.toContain(sibling);
+  });
+
+  it("creates a caller-provided output directory before finalizing the DMG", () => {
+    const app = makeValidApp();
+    const root = mkdtempSync(path.join(tmpdir(), "openclaw-create-dmg-output-"));
+    tempDirs.push(root);
+    const outputDir = path.join(root, "nested", "artifacts");
+    const output = path.join(outputDir, "OpenClaw.dmg");
+    const tools = makeFakeDmgTools();
+
+    const result = runScript([app, output], tools.env);
+
+    expect(result.status).toBe(0);
+    expect(existsSync(outputDir)).toBe(true);
+    expect(readFileSync(output, "utf8")).toBe("converted");
+    const log = readFileSync(tools.hdiutilLog, "utf8");
+    expect(log).toContain(`${outputDir}${path.sep}.openclaw-dmg.`);
   });
 
   it("preserves an existing output when image creation fails", () => {
@@ -228,6 +322,42 @@ describe.runIf(process.platform === "darwin")("create-dmg ownership boundaries",
     expect(result.status).not.toBe(0);
     expect(readFileSync(output, "utf8")).toBe("previous output");
     expect(readFileSync(tools.hdiutilLog, "utf8")).not.toContain("detach");
+  });
+
+  it("fails before image creation when Finder layout values are malformed", () => {
+    const app = makeValidApp();
+    const outputDir = mkdtempSync(path.join(tmpdir(), "openclaw-create-dmg-output-"));
+    tempDirs.push(outputDir);
+    const output = path.join(outputDir, "OpenClaw.dmg");
+    const tools = makeFakeDmgTools();
+
+    const result = runScript([app, output], {
+      ...tools.env,
+      DMG_WINDOW_BOUNDS: "400 nope 900 420",
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("DMG_WINDOW_BOUNDS must contain only integer values");
+    expect(existsSync(output)).toBe(false);
+    expect(existsSync(tools.hdiutilLog) ? readFileSync(tools.hdiutilLog, "utf8") : "").toBe("");
+  });
+
+  it("fails before image creation when Finder layout values span multiple lines", () => {
+    const app = makeValidApp();
+    const outputDir = mkdtempSync(path.join(tmpdir(), "openclaw-create-dmg-output-"));
+    tempDirs.push(outputDir);
+    const output = path.join(outputDir, "OpenClaw.dmg");
+    const tools = makeFakeDmgTools();
+
+    const result = runScript([app, output], {
+      ...tools.env,
+      DMG_WINDOW_BOUNDS: "400 100 900 420\nnope",
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("DMG_WINDOW_BOUNDS must be a single line");
+    expect(existsSync(output)).toBe(false);
+    expect(existsSync(tools.hdiutilLog) ? readFileSync(tools.hdiutilLog, "utf8") : "").toBe("");
   });
 
   it("preserves an existing output when verification fails", () => {
@@ -266,13 +396,31 @@ describe.runIf(process.platform === "darwin")("create-dmg ownership boundaries",
     const log = readFileSync(tools.hdiutilLog, "utf8");
     expect(log).not.toContain("resize");
     expect(log).not.toContain("convert");
-    expect(log).not.toContain("/Volumes/");
-    const mountPoint = log.match(/-mountpoint ([^ ]+)/)?.[1];
-    expect(mountPoint).toBeTruthy();
-    expect(readFileSync(path.join(mountPoint as string, "live-volume-file"), "utf8")).toBe(
-      "mounted",
-    );
-    rmSync(path.dirname(mountPoint as string), { recursive: true, force: true });
+    const mountPoint = expectPrivateDmgMount(log);
+    expect(readFileSync(path.join(mountPoint, "live-volume-file"), "utf8")).toBe("mounted");
+    rmSync(path.dirname(mountPoint), { recursive: true, force: true });
+  });
+
+  it("retries a delayed DMG detach before finalizing the artifact", () => {
+    const app = makeValidApp();
+    const outputDir = mkdtempSync(path.join(tmpdir(), "openclaw-create-dmg-output-"));
+    tempDirs.push(outputDir);
+    const output = path.join(outputDir, "OpenClaw.dmg");
+    const tools = makeFakeDmgTools();
+
+    const result = runScript([app, output], {
+      ...tools.env,
+      HDIUTIL_DETACH_FAIL_COUNT: "6",
+    });
+
+    expect(result.status).toBe(0);
+    expect(readFileSync(output, "utf8")).toBe("converted");
+    const log = readFileSync(tools.hdiutilLog, "utf8");
+    expect(log.match(/^detach /gm)).toHaveLength(7);
+    expect(log).toContain("detach ");
+    expect(log).toContain("-force");
+    expect(log).toContain("resize");
+    expect(log).toContain("convert ");
   });
 
   it("styles the private mount without closing unrelated Finder windows", () => {

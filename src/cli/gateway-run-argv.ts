@@ -1,5 +1,14 @@
 // Fast-path argv parser for `openclaw gateway ...` without full Commander registration.
-import { consumeRootOptionToken, isValueToken } from "../infra/cli-root-options.js";
+import {
+  WINDOWS_TASK_SUPERVISOR_CHILD_FLAG,
+  WINDOWS_TASK_SUPERVISOR_FLAG,
+} from "../daemon/windows-task-supervisor-contract.js";
+import {
+  consumeRootCommandOptionToken,
+  getCommandArgsWithRootOptions,
+  getCommandPositionalsWithRootOptions,
+  isValueToken,
+} from "../infra/cli-root-options.js";
 
 const GATEWAY_RUN_VALUE_FLAGS = new Set([
   "--port",
@@ -18,7 +27,10 @@ const GATEWAY_RUN_BOOLEAN_FLAGS = new Set([
   "--tailscale-reset-on-exit",
   "--allow-unconfigured",
   "--dev",
+  "--ambient-channels",
+  "--dev-ambient-channels",
   "--reset",
+  "--update-canary",
   "--force",
   "--verbose",
   "--cli-backend-logs",
@@ -26,6 +38,21 @@ const GATEWAY_RUN_BOOLEAN_FLAGS = new Set([
   "--compact",
   "--raw-stream",
 ]);
+
+export function isForegroundGatewayRunArgv(argv: string[]): boolean {
+  const positionals = getCommandPositionalsWithRootOptions(argv, {
+    commandPath: ["gateway"],
+    booleanFlags: [...GATEWAY_RUN_BOOLEAN_FLAGS],
+    valueFlags: [...GATEWAY_RUN_VALUE_FLAGS],
+    mode: "command-path",
+  });
+  if (!positionals) {
+    return false;
+  }
+  // Foreground gateway owns the terminal/process environment itself; respawning would
+  // add an extra parent process around the long-lived server.
+  return positionals.length === 0 || (positionals.length === 1 && positionals[0] === "run");
+}
 
 /** Return how many argv tokens a gateway-run option consumes, or 0 when not recognized. */
 export function consumeGatewayRunOptionToken(args: ReadonlyArray<string>, index: number): number {
@@ -51,14 +78,17 @@ function consumeGatewayRunPreBootstrapOptionToken(
   args: ReadonlyArray<string>,
   index: number,
 ): number {
+  const rootConsumed = consumeRootCommandOptionToken(args, index);
+  if (rootConsumed > 0) {
+    return rootConsumed;
+  }
   const consumed = consumeGatewayRunOptionToken(args, index);
   if (consumed > 0) {
     return consumed;
   }
   const arg = args[index];
   if (arg && GATEWAY_RUN_VALUE_FLAGS.has(arg) && args[index + 1] !== undefined) {
-    // Commander will reject option-looking required values later. Consume them here so malformed
-    // input cannot accidentally enable a destructive flag before parsing reaches that error.
+    // Required values can look like flags; consume them before considering destructive options.
     return 2;
   }
   return 0;
@@ -85,75 +115,43 @@ export function consumeGatewayFastPathRootOptionToken(
   return 0;
 }
 
-/** Resolve the gateway command path from raw argv for catalog/policy lookups. */
+/** Resolve the gateway command path from raw argv without full Commander registration. */
+export function resolveGatewayCommandPath(argv: string[], depth = 2): string[] | null {
+  const positionals = getCommandPositionalsWithRootOptions(argv, {
+    commandPath: ["gateway"],
+    // Supervisor commands use full parsing but still need Gateway startup selection.
+    booleanFlags: [...GATEWAY_RUN_BOOLEAN_FLAGS, WINDOWS_TASK_SUPERVISOR_FLAG],
+    valueFlags: [...GATEWAY_RUN_VALUE_FLAGS, WINDOWS_TASK_SUPERVISOR_CHILD_FLAG],
+    maxPositionals: depth - 1,
+    mode: "command-path",
+  });
+  return positionals ? ["gateway", ...positionals] : null;
+}
+
+/** Resolve the gateway command path used by catalog and startup-policy lookups. */
 export function resolveGatewayCatalogCommandPath(argv: string[]): string[] | null {
-  const args = argv.slice(2);
-  let sawGateway = false;
-
-  for (let index = 0; index < args.length; index += 1) {
-    const arg = args[index];
-    if (!arg || arg === "--") {
-      break;
-    }
-    if (!sawGateway) {
-      const consumed = consumeRootOptionToken(args, index);
-      if (consumed > 0) {
-        index += consumed - 1;
-        continue;
-      }
-      if (arg.startsWith("-")) {
-        continue;
-      }
-      if (arg !== "gateway") {
-        return null;
-      }
-      sawGateway = true;
-      continue;
-    }
-
-    const consumed = consumeGatewayRunOptionToken(args, index);
-    if (consumed > 0) {
-      index += consumed - 1;
-      continue;
-    }
-    if (arg.startsWith("-")) {
-      continue;
-    }
-    return ["gateway", arg];
-  }
-
-  return sawGateway ? ["gateway"] : null;
+  return resolveGatewayCommandPath(argv, 2);
 }
 
 /** Resolve destructive gateway-run flags before Commander registration. */
 export function resolveGatewayRunPreBootstrapOptions(
   argv: string[],
 ): { force: boolean; reset: boolean } | null {
-  const args = argv.slice(2);
+  const args = getCommandArgsWithRootOptions(argv, {
+    commandPath: ["gateway"],
+    mode: "command-path",
+  });
+  if (!args) {
+    return null;
+  }
   let force = false;
   let reset = false;
-  let sawGateway = false;
   let sawRun = false;
 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (!arg || arg === "--") {
       break;
-    }
-    if (!sawGateway) {
-      const consumed = consumeRootOptionToken(args, index);
-      if (consumed > 0) {
-        index += consumed - 1;
-        continue;
-      }
-      if (arg.startsWith("-")) {
-        continue;
-      }
-      if (arg !== "gateway") {
-        return null;
-      }
-      sawGateway = true;
-      continue;
     }
     if (!sawRun && arg === "run") {
       sawRun = true;
@@ -169,15 +167,10 @@ export function resolveGatewayRunPreBootstrapOptions(
       index += consumed - 1;
       continue;
     }
-    if (arg === "--force") {
-      force = true;
-    } else if (arg === "--reset") {
-      reset = true;
-    }
     if (!arg.startsWith("-")) {
       return null;
     }
   }
 
-  return sawGateway ? { force, reset } : null;
+  return { force, reset };
 }

@@ -1,65 +1,9 @@
 // Coverage for Tool Search control planning and allowlist accounting.
+import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
-import { setPluginToolMeta } from "../../../plugins/tools.js";
-import {
-  buildAutoAddedToolSearchControlNamesForAllowlistCheck,
-  buildCallableToolNamesForEmptyAllowlistCheck,
-  buildToolSearchRunPlan,
-} from "./attempt.tool-search-run-plan.js";
-
-describe("buildCallableToolNamesForEmptyAllowlistCheck", () => {
-  it("ignores auto-added Tool Search controls so bad allowlists still fail", () => {
-    // Auto-added controls are not real callable tools when the backing catalog
-    // is empty.
-    expect(
-      buildCallableToolNamesForEmptyAllowlistCheck({
-        effectiveToolNames: ["tool_search_code"],
-        autoAddedToolSearchControlNames: new Set(["tool_search_code"]),
-        toolSearchCatalogToolCount: 0,
-      }),
-    ).toEqual([]);
-  });
-
-  it("counts cataloged tools hidden behind auto-added Tool Search controls", () => {
-    expect(
-      buildCallableToolNamesForEmptyAllowlistCheck({
-        effectiveToolNames: ["tool_search_code"],
-        autoAddedToolSearchControlNames: new Set(["tool_search_code"]),
-        toolSearchCatalogToolCount: 1,
-      }),
-    ).toEqual(["tool-search:0"]);
-  });
-
-  it("keeps explicitly requested Tool Search controls callable", () => {
-    expect(
-      buildCallableToolNamesForEmptyAllowlistCheck({
-        effectiveToolNames: ["tool_search_code"],
-        autoAddedToolSearchControlNames: new Set(),
-        toolSearchCatalogToolCount: 0,
-      }),
-    ).toEqual(["tool_search_code"]);
-  });
-});
-
-describe("buildAutoAddedToolSearchControlNamesForAllowlistCheck", () => {
-  it("treats controls as auto-added unless any explicit allowlist requested them", () => {
-    expect(
-      buildAutoAddedToolSearchControlNamesForAllowlistCheck({
-        toolSearchControlsEnabled: true,
-        explicitAllowlistSources: [{ entries: ["missing_tool"] }],
-        controlNames: ["tool_search_code", "tool_search"],
-      }),
-    ).toEqual(new Set(["tool_search_code", "tool_search"]));
-
-    expect(
-      buildAutoAddedToolSearchControlNamesForAllowlistCheck({
-        toolSearchControlsEnabled: true,
-        explicitAllowlistSources: [{ entries: ["tool_search_code"] }],
-        controlNames: ["tool_search_code", "tool_search"],
-      }),
-    ).toEqual(new Set(["tool_search"]));
-  });
-});
+import { setPluginToolMeta } from "../../../plugins/tool-metadata.js";
+import type { AnyAgentTool } from "../../tools/common.js";
+import { buildToolSearchRunPlan } from "./attempt-tool-search-run-plan.js";
 
 describe("buildToolSearchRunPlan", () => {
   it("keeps compact visible names separate from replay-safe names", () => {
@@ -96,7 +40,7 @@ describe("buildToolSearchRunPlan", () => {
     ]);
     expect(plan.liveAllowedToolNames).toBe(plan.visibleAllowedToolNames);
     expect([...plan.capabilityToolNames]).toEqual(["tool_search_code"]);
-    expect(plan.emptyAllowlistCallableNames).toEqual(["tool-search:0", "tool-search:1"]);
+    expect(plan.hasCallableTools).toBe(true);
   });
 
   it("counts explicitly allowlisted client tools before they are cataloged later", () => {
@@ -118,7 +62,7 @@ describe("buildToolSearchRunPlan", () => {
       explicitAllowlistSources: [{ entries: ["client_pick_file"] }],
     });
 
-    expect(plan.emptyAllowlistCallableNames).toEqual(["tool-search-client:client_pick_file"]);
+    expect(plan.hasCallableTools).toBe(true);
   });
 
   it("keeps code-mode control tools in replay-safe names", () => {
@@ -136,7 +80,58 @@ describe("buildToolSearchRunPlan", () => {
     expect([...plan.visibleAllowedToolNames]).toEqual(["exec", "wait"]);
     expect([...plan.replayAllowedToolNames]).toEqual(["fake_plugin_tool", "exec", "wait"]);
     expect([...plan.capabilityToolNames]).toEqual(["exec", "wait"]);
-    expect(plan.emptyAllowlistCallableNames).toEqual(["tool-search:0"]);
+    expect(plan.hasCallableTools).toBe(true);
+  });
+
+  it("carries native catalog capabilities without widening direct execution authority", () => {
+    const tool = (name: string): AnyAgentTool => ({
+      name,
+      label: name,
+      description: "Tool inventory fixture",
+      parameters: Type.Object({}),
+      execute: async () => ({ content: [], details: undefined }),
+    });
+    const foreignTool = tool("sessions_yield");
+    setPluginToolMeta(foreignTool, { pluginId: "bundle-mcp", optional: false });
+    const catalogCapabilityTools = [
+      ...["process", "sessions_spawn", "image_generate", "music_generate", "video_generate"].map(
+        tool,
+      ),
+      foreignTool,
+    ];
+    const input = {
+      visibleTools: [tool("exec"), tool("wait")],
+      uncompactedTools: catalogCapabilityTools,
+      catalogCapabilityTools,
+      clientTools: [
+        {
+          type: "function" as const,
+          function: { name: "subagents", parameters: { type: "object", properties: {} } },
+        },
+      ],
+      clientToolsCataloged: true,
+      catalogToolCount: catalogCapabilityTools.length,
+      controlsEnabled: true,
+      deferredToolsCallable: false,
+      controlNames: ["exec", "wait"],
+      explicitAllowlistSources: [],
+    };
+    const plan = buildToolSearchRunPlan(input);
+
+    expect(plan.capabilityToolNames).toEqual(
+      new Set([
+        "exec",
+        "wait",
+        "process",
+        "sessions_spawn",
+        "image_generate",
+        "music_generate",
+        "video_generate",
+      ]),
+    );
+    expect([...plan.visibleAllowedToolNames]).toEqual(["exec", "wait"]);
+    expect([...plan.liveAllowedToolNames]).toEqual(["exec", "wait"]);
+    expect(plan.replayAllowedToolNames.has("sessions_spawn")).toBe(true);
   });
 
   it("does not let unrelated client tools mask a bad explicit allowlist", () => {
@@ -158,7 +153,20 @@ describe("buildToolSearchRunPlan", () => {
       explicitAllowlistSources: [{ entries: ["missing_tool"] }],
     });
 
-    expect(plan.emptyAllowlistCallableNames).toEqual([]);
+    expect(plan.hasCallableTools).toBe(false);
+  });
+
+  it("keeps explicitly requested Tool Search controls callable", () => {
+    const plan = buildToolSearchRunPlan({
+      visibleTools: [{ name: "tool_search_code" }] as never,
+      uncompactedTools: [{ name: "tool_search_code" }] as never,
+      clientToolsCataloged: true,
+      catalogToolCount: 0,
+      controlsEnabled: true,
+      explicitAllowlistSources: [{ entries: ["tool_search_code"] }],
+    });
+
+    expect(plan.hasCallableTools).toBe(true);
   });
 
   it("keeps uncataloged directory-mode client tools visible", () => {
@@ -200,7 +208,7 @@ describe("buildToolSearchRunPlan", () => {
       "client_pick_file",
     ]);
     expect([...plan.capabilityToolNames]).toEqual(["fake_plugin_tool"]);
-    expect(plan.emptyAllowlistCallableNames).toEqual(["tool-search:0"]);
+    expect(plan.hasCallableTools).toBe(true);
   });
 
   it("does not let visible directory client tools mask a bad explicit allowlist", () => {
@@ -229,7 +237,7 @@ describe("buildToolSearchRunPlan", () => {
     });
 
     expect([...plan.visibleAllowedToolNames]).toContain("client_pick_file");
-    expect(plan.emptyAllowlistCallableNames).toEqual([]);
+    expect(plan.hasCallableTools).toBe(false);
   });
 
   it("counts explicitly allowlisted visible directory client tools", () => {
@@ -257,7 +265,7 @@ describe("buildToolSearchRunPlan", () => {
       explicitAllowlistSources: [{ entries: ["client_pick_file"] }],
     });
 
-    expect(plan.emptyAllowlistCallableNames).toEqual(["client_pick_file"]);
+    expect(plan.hasCallableTools).toBe(true);
   });
 
   it("counts wildcard-allowlisted visible directory client tools", () => {
@@ -285,7 +293,7 @@ describe("buildToolSearchRunPlan", () => {
       explicitAllowlistSources: [{ entries: ["client_*"] }],
     });
 
-    expect(plan.emptyAllowlistCallableNames).toEqual(["client_pick_file"]);
+    expect(plan.hasCallableTools).toBe(true);
   });
 
   it("keeps client names out of OpenClaw capability guidance", () => {

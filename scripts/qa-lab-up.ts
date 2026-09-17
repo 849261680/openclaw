@@ -2,7 +2,7 @@
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { parseStrictPositiveInteger } from "../src/infra/parse-finite-number.js";
+import { parseStrictPositiveInteger } from "@openclaw/normalization-core/number-coercion";
 
 const options = {
   help: { type: "boolean", short: "h" },
@@ -33,17 +33,16 @@ Options:
 }
 
 function parseQaLabUpArgs(argv: readonly string[]) {
+  const args = argv[0] === "--" ? argv.slice(1) : argv;
   return parseArgs({
-    args: [...argv],
+    args: [...args],
     options,
     allowPositionals: false,
   }).values;
 }
 
 export const qaLabUpTesting = {
-  parseQaLabUpArgs,
   runQaLabUp,
-  usage,
 };
 
 type QaLabRuntime = typeof import("../extensions/qa-lab/src/cli.runtime.ts");
@@ -66,7 +65,7 @@ async function runQaLabUp(argv: readonly string[], deps: QaLabUpDeps = {}): Prom
   }
 
   const parsePort = (value: string | undefined, flag: string) => {
-    if (!value) {
+    if (value === undefined) {
       return undefined;
     }
     const parsed = parseStrictPositiveInteger(value);

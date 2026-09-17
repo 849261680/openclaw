@@ -1,58 +1,43 @@
 // Android Sync Versioning script supports OpenClaw repository automation.
-import path from "node:path";
-import { syncAndroidVersioning } from "./lib/android-version.ts";
+import { checkAndroidVersioning } from "./lib/android-version.ts";
+import { parseVersionSyncArgs } from "./lib/version-script-args.ts";
 
-type Mode = "check" | "write";
+export { parseVersionSyncArgs as parseArgs } from "./lib/version-script-args.ts";
 
-export function parseArgs(argv: string[]): { mode: Mode; rootDir: string } {
-  let mode: Mode = "write";
-  let rootDir = path.resolve(".");
-
-  for (let index = 0; index < argv.length; index += 1) {
-    const arg = argv[index];
-    switch (arg) {
-      case "--check": {
-        mode = "check";
-        break;
-      }
-      case "--write": {
-        mode = "write";
-        break;
-      }
-      case "--root": {
-        const value = argv[index + 1];
-        if (!value) {
-          throw new Error("Missing value for --root.");
-        }
-        rootDir = path.resolve(value);
-        index += 1;
-        break;
-      }
-      case "-h":
-      case "--help": {
-        console.log(
-          "Usage: node --import tsx scripts/android-sync-versioning.ts [--write|--check] [--root dir]",
-        );
-        process.exit(0);
-      }
-      default: {
-        throw new Error(`Unknown argument: ${arg}`);
-      }
-    }
-  }
-
-  return { mode, rootDir };
+function printUsage(): void {
+  process.stdout.write(
+    "Usage: node --import tsx scripts/android-sync-versioning.ts --check [--require-mobile-release] [--revision n] [--root dir]\n",
+  );
 }
 
-const options = parseArgs(process.argv.slice(2));
-const result = syncAndroidVersioning({ mode: options.mode, rootDir: options.rootDir });
-
-if (options.mode === "check") {
-  process.stdout.write("Android versioning artifacts are up to date.\n");
-} else if (result.updatedPaths.length === 0) {
-  process.stdout.write("Android versioning artifacts already up to date.\n");
-} else {
-  process.stdout.write(
-    `Updated Android versioning artifacts:\n- ${result.updatedPaths.map((filePath) => path.relative(process.cwd(), filePath)).join("\n- ")}\n`,
+function main(argv = process.argv.slice(2)): number {
+  const requireMobileRelease = argv.includes("--require-mobile-release");
+  const options = parseVersionSyncArgs(
+    argv.filter((arg) => arg !== "--require-mobile-release"),
+    { allowAppStoreRevision: true },
   );
+  if (options.help) {
+    printUsage();
+    return 0;
+  }
+
+  if (options.mode !== "check") {
+    throw new Error(
+      "Android version sync is retired. Run the shared mobile cutter in scripts/mobile-release-version.ts.",
+    );
+  }
+  checkAndroidVersioning({
+    appStoreRevision: options.appStoreRevision ?? undefined,
+    requireMobileRelease,
+    rootDir: options.rootDir,
+  });
+  process.stdout.write("Android versioning artifacts match committed release metadata.\n");
+  return 0;
+}
+
+try {
+  process.exitCode = main();
+} catch (error) {
+  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+  process.exitCode = 1;
 }

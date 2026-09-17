@@ -1,6 +1,9 @@
 import { finiteSecondsToTimerSafeMilliseconds } from "@openclaw/normalization-core/number-coercion";
-import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { runCommandWithTimeout } from "../process/exec.js";
+import {
+  buildCronCommandSummary,
+  isCronCommandActionCriticalLine,
+} from "./command-output-summary.js";
 import type { CronRunDiagnostics, CronRunOutcome, CronRunStatus, CronJob } from "./types.js";
 
 const DEFAULT_COMMAND_TIMEOUT_MS = 10 * 60_000;
@@ -18,19 +21,6 @@ function secondsToMs(value: number | undefined): number | undefined {
 
 function formatCommand(argv: string[]): string {
   return argv.map((arg) => JSON.stringify(arg)).join(" ");
-}
-
-function trimOutput(value: string): string | undefined {
-  return normalizeOptionalString(value);
-}
-
-function buildCommandSummary(params: { stdout: string; stderr: string }): string | undefined {
-  const stdout = trimOutput(params.stdout);
-  const stderr = trimOutput(params.stderr);
-  if (stdout && stderr) {
-    return `stdout:\n${stdout}\n\nstderr:\n${stderr}`;
-  }
-  return stdout ?? stderr;
 }
 
 function commandErrorMessage(params: {
@@ -115,27 +105,56 @@ export async function runCronCommandJob(params: {
       ...(payload.env ? { env: payload.env } : {}),
       ...(noOutputTimeoutMs !== undefined ? { noOutputTimeoutMs } : {}),
       ...(payload.outputMaxBytes !== undefined ? { maxOutputBytes: payload.outputMaxBytes } : {}),
+      preserveOutputLine: isCronCommandActionCriticalLine,
       ...(params.abortSignal ? { signal: params.abortSignal } : {}),
       killProcessTree: true,
     });
+    const termination =
+      result.termination === "signal" &&
+      params.abortSignal?.reason instanceof Error &&
+      params.abortSignal.reason.name === "TimeoutError"
+        ? "timeout"
+        : result.termination;
     const ok =
       result.code === 0 &&
       !result.killed &&
-      result.termination !== "timeout" &&
-      result.termination !== "no-output-timeout" &&
-      result.termination !== "signal";
+      termination !== "timeout" &&
+      termination !== "no-output-timeout" &&
+      termination !== "signal";
     const status: CronRunStatus = ok ? "ok" : "error";
-    const summary = buildCommandSummary({ stdout: result.stdout, stderr: result.stderr });
+    const summary = buildCronCommandSummary({
+      stdout: result.stdout,
+      stderr: result.stderr,
+      preservedStdoutLines: result.preservedStdoutLines,
+      preservedStderrLines: result.preservedStderrLines,
+    });
     const error = ok
       ? undefined
       : commandErrorMessage({
           code: result.code,
           signal: result.signal,
-          termination: result.termination,
+          termination,
         });
+    const failureNotificationDetail =
+      termination === "timeout"
+        ? ({ kind: "command-timeout", mode: "wall-clock" } as const)
+        : termination === "no-output-timeout"
+          ? ({ kind: "command-timeout", mode: "no-output" } as const)
+          : termination === "exit" && typeof result.code === "number" && result.code !== 0
+            ? ({ kind: "command-exit", exitCode: result.code } as const)
+            : undefined;
     return {
       status,
       ...(error ? { error } : {}),
+      ...(failureNotificationDetail
+        ? {
+            failureNotificationDetail,
+            errorClassification:
+              failureNotificationDetail.kind === "command-timeout"
+                ? ({ kind: "reason", reason: "timeout" } as const)
+                : ({ kind: "permanent" } as const),
+          }
+        : {}),
       ...(summary ? { summary } : {}),
       diagnostics: buildDiagnostics({
         command,
@@ -153,6 +172,9 @@ export async function runCronCommandJob(params: {
     return {
       status: "error",
       error,
+      ...(err instanceof Error && "code" in err && err.code === "ENOENT"
+        ? { errorClassification: { kind: "permanent" as const } }
+        : {}),
       diagnostics: {
         summary: error,
         entries: [

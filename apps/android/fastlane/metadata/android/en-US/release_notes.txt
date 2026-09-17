@@ -1,3 +1,7 @@
-OpenClaw is now available on Android.
+View your connected machine's desktop from your phone, and follow live subagent progress in chat.
 
-Connect to your OpenClaw Gateway to chat with your assistant, use realtime Talk mode, review approvals, and bring Android device capabilities like camera, location, screen, and notifications into your private automation workflows.
+Organize conversations with session groups, nested threads, and colors. Switch agents more easily and receive reply notifications.
+
+Keeps queued messages and offline history intact across reconnects, recovers truncated replies, and preserves shared attachments.
+
+Improves Talk playback, photo orientation, notification consent, and connections through Gateway proxy paths.
